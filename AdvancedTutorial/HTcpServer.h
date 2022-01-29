@@ -17,6 +17,8 @@
 **********************************************/
 #define  socket_t              int
 #define  INVALID_SOCKET        -1
+#define  SELECT_TIMEOUT_S          5
+#define  SELECT_TIMEOUT_US         0
 
 enum LinkStatus
 {
@@ -40,6 +42,9 @@ class Thread;
 class TcpTask;
 struct event_base;
 typedef int (*ProcessHandler)(TcpTask* task, unsigned char* DataBuffer, int size);
+typedef int (*WriteProcessHandler)(TcpTask* task);
+typedef int (*ClosedProcessHandler)(TcpTask* task);
+typedef int (*TimeoutProcessHandler)(TcpTask* task);
 extern int  Send(TcpTask* task, unsigned char* data, int size); 
 extern void Close(TcpTask* task);
 extern int  GetPeerInfo(int sockfd, std::string& ip, unsigned short& port);
@@ -54,7 +59,7 @@ class Locker
 public:
 	Locker()
 	{
-		if (pthread_mutex_init(&m_mutex, NULL) != 0)   //锁初始化
+		if (pthread_mutex_init(&m_mutex, NULL) != 0)   
 		{
 			throw std::exception();
 		}
@@ -62,7 +67,7 @@ public:
 
 	~Locker()
 	{
-		if (pthread_mutex_destroy(&m_mutex) != 0)    //锁销毁
+		if (pthread_mutex_destroy(&m_mutex) != 0)   
 		{
 			throw std::exception();
 		}
@@ -70,12 +75,12 @@ public:
 
 	bool lock()
 	{
-		return pthread_mutex_lock(&m_mutex) == 0;   //上锁
+		return pthread_mutex_lock(&m_mutex) == 0;  
 	}
 
 	bool unlock()
 	{
-		return pthread_mutex_unlock(&m_mutex) == 0; //解锁
+		return pthread_mutex_unlock(&m_mutex) == 0;
 	}
 
 	pthread_mutex_t* get_mutex()
@@ -84,7 +89,7 @@ public:
 	}
 
 private:
-	pthread_mutex_t m_mutex;   //互斥锁
+	pthread_mutex_t m_mutex;  
 };
 
 
@@ -120,19 +125,31 @@ public:
 	int  PushBackToBuffer(unsigned char* buffer, int size);
 	int  GetAllData(unsigned char*& buff, int& size) { return m_Buffer.GetAllBuffer(buff,size); }
 	int  RemoveData(const int size) { return m_Buffer.RemoveData(size); }
-	void SetConnFd(int Sock, ProcessHandler Handler, const struct timeval& Timeout) { m_Sock = Sock; m_Handler = Handler; m_Timeout = Timeout; }
+	//void SetConnFd(int Sock, ProcessHandler Handler, const struct timeval& Timeout) { m_Sock = Sock; m_Handler = Handler; m_Timeout = Timeout; }
+	void SetConnFd(int Sock, ProcessHandler Handler, WriteProcessHandler WriteHandler, ClosedProcessHandler ClosedHandler, TimeoutProcessHandler TimeoutHandler, const struct timeval& Timeout) { m_Sock = Sock; m_Handler = Handler; m_WriteHandler = WriteHandler; m_ClosedHandler = ClosedHandler; m_TimeoutHandler = TimeoutHandler; m_Timeout = Timeout; }
 	int  SendData(unsigned char* data, int size);
+	int	 GetPeerConnInfo();
+	std::string GetPeerIp();
+	int  GetPeerPort();
 	void Init();                            
 	void Close();
+	struct bufferevent* GetBufferEv() { return m_BufferEv; }
 
-	struct event_base*   m_Base;
-	ProcessHandler       m_Handler;
+	struct event_base*    m_Base;
+	ProcessHandler        m_Handler;
+	WriteProcessHandler   m_WriteHandler;
+	ClosedProcessHandler  m_ClosedHandler; 
+	TimeoutProcessHandler m_TimeoutHandler;
+
 private:
 	int                  m_Sock;
 	struct bufferevent*  m_BufferEv;
 	int                  m_ThreadId;
 	struct QueueBuffer   m_Buffer;
 	struct timeval       m_Timeout;
+
+	std::string			m_PeerIp;
+	int					m_PeerPort;
 };
 
 /**********************************************
@@ -203,17 +220,23 @@ public:
 	HTcpServer();
 	~HTcpServer();
 
-	int            Init(short Port,int ThreadNums, ProcessHandler Handler,const struct timeval& Timeout);  //Server初始化
+	int            Init(short Port,int ThreadNums, ProcessHandler Handler,const struct timeval& Timeout); 
+	int            Init(short Port, ProcessHandler Handler, WriteProcessHandler WriteHandler, ClosedProcessHandler ClosedHandler, TimeoutProcessHandler TimeoutHandler, const struct timeval& Timeout, const char** ErrMsg, int ThreadNums=3);
 	void           Run();                            //Server开始事件循环
 	void           Dispatch(TcpTask* task);          //分发任务
 	struct timeval GetTimeout() { return m_Timeout; }
 
-	ProcessHandler          m_Handler;           //处理句柄
+	ProcessHandler          m_Handler;          
+	WriteProcessHandler     m_WriteHandler;
+	ClosedProcessHandler    m_ClosedHandler;
+	TimeoutProcessHandler   m_TimeoutHandler;
+
 private:
 	struct event_base*      m_Base;              //Server的libevent上下文
 	struct evconnlistener*  m_Listener;          //监听对象
 	ThreadPool*             m_ThreadPool;        //线程池
 	struct timeval          m_Timeout;           //超时时间
+	char                    m_ErrMsg[128];       //错误信息
 };
 
 /**********************************************
@@ -233,13 +256,17 @@ public:
 	CTcpClient();
 	~CTcpClient();
 
-	int  Close() { return CloseRunSocket(); };
+	int  Close();
+	int  Close(const char** errmsg);
 	int  InitSocket(const char* ip, const short& port);
+	int  InitSocket(const char* ip, const short& port, const char** errmsg);
 	int  GetClientFd() const { return m_nSockFd; }
 	int	 SetClientFd(int Fd) { m_nSockFd = Fd; }
 	int  GetLinkStatus() const { return m_nCommLinkStatus; }
 	int  SendMsg(char* buf, int len);
+	int  SendMsg(char* buf, int len, const char** errmsg, int tmp_sec = SELECT_TIMEOUT_S, int tmp_usec = SELECT_TIMEOUT_US);
 	int  RecvMsg();
+	int  RecvMsg(const char** errmsg, int tmp_sec = SELECT_TIMEOUT_S, int tmp_usec = SELECT_TIMEOUT_US);
 	int  GetAllBuffer(unsigned char*& buff, int& size) { return m_QueueBuffer.GetAllBuffer(buff, size); } //获取所有读取到的字节，如果出现丢包/粘包现象，重新调用RecvMsg接口，并重新调用GetAllBuffer
 	int  NotifyBufferIsComplete(MsgStatus msg_status, int len);//传入报文状态，如果报文完整，则传入MSG_IS_COMPLETE以及当前报文长度
 	char* GetIp() { return m_TcpPara.IpAddr; }
@@ -259,6 +286,7 @@ private:
 	LinkStatus		  m_nCommLinkStatus;
 	TcpPara			  m_TcpPara;
 	QueueBuffer		  m_QueueBuffer;	  //Client存储的Buffer队列
+	char              m_ErrMsg[128];      //错误信息
 };
 
 #endif
